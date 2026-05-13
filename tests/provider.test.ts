@@ -1792,7 +1792,12 @@ describe("streamViaCli", () => {
       const context = {
         messages: [
           { role: "user", content: "Hello" },
-          { role: "assistant", content: "Hi" },
+          {
+            role: "assistant",
+            content: "Hi",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
           { role: "user", content: "Follow-up" },
         ],
       };
@@ -1856,7 +1861,12 @@ describe("streamViaCli", () => {
       const context = {
         messages: [
           { role: "user", content: "first message" },
-          { role: "assistant", content: "response" },
+          {
+            role: "assistant",
+            content: "response",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
           { role: "user", content: "follow-up" },
         ],
       };
@@ -1880,7 +1890,12 @@ describe("streamViaCli", () => {
       const context = {
         messages: [
           { role: "user", content: "Hello" },
-          { role: "assistant", content: "Hi" },
+          {
+            role: "assistant",
+            content: "Hi",
+            provider: "pi-claude-cli",
+            api: "pi-claude-cli",
+          },
           { role: "user", content: "follow-up" },
         ],
         systemPrompt: "Be helpful",
@@ -1897,6 +1912,100 @@ describe("streamViaCli", () => {
       const proc = (spawn as any).mock.results[0].value;
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
+    });
+
+    it("uses --session-id (not --resume) when prior assistant turns are from a different provider", async () => {
+      // Regression test: switching to pi-claude-cli mid-session from another
+      // provider must not --resume a CLI session that was never created,
+      // because `claude --resume <unknown>` fails silently and pi receives
+      // an empty assistant message.
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "earlier prompt" },
+          {
+            role: "assistant",
+            content: "earlier reply",
+            provider: "anthropic",
+            api: "anthropic",
+          },
+          { role: "user", content: "first pi-claude-cli prompt" },
+        ],
+        systemPrompt: "Be helpful",
+      };
+
+      streamViaCli(model, context, { sessionId: "sess-cross" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).not.toContain("--resume");
+      expect(args).toContain("--session-id");
+      const idx = args.indexOf("--session-id");
+      expect(args[idx + 1]).toBe("sess-cross");
+      // Fresh session must send the system prompt and full history.
+      expect(args).toContain("--append-system-prompt");
+
+      // Clean up
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+  });
+
+  describe("non-success result surfacing", () => {
+    function findErrorText(): string {
+      const mockStream = MockAssistantMessageEventStream.mock.instances[0];
+      const doneEvent = mockStream._events.find(
+        (e: any) => e.type === "done" && e.message,
+      );
+      expect(doneEvent).toBeDefined();
+      return (doneEvent.message.content ?? [])
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text)
+        .join("");
+    }
+
+    it("surfaces result.subtype = 'error_during_execution' as an error", async () => {
+      const model = mockModels[0] as any;
+      const context = { messages: [{ role: "user", content: "hi" }] };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.write(
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          errors: ["No conversation found with session ID: sess-xyz"],
+        }) + "\n",
+      );
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(findErrorText()).toMatch(/No conversation found/);
+    });
+
+    it("surfaces result with is_error: true as an error", async () => {
+      const model = mockModels[0] as any;
+      const context = { messages: [{ role: "user", content: "hi" }] };
+
+      streamViaCli(model, context);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.write(
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          error: "boom",
+        }) + "\n",
+      );
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(findErrorText()).toMatch(/boom/);
     });
   });
 });
