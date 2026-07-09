@@ -13,11 +13,27 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ChildProcess } from "node:child_process";
 
+function isTruthyEnv(name: string): boolean {
+  const value = process.env[name]?.toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+function isFalseyEnv(name: string): boolean {
+  const value = process.env[name]?.toLowerCase();
+  return (
+    value === "0" || value === "false" || value === "no" || value === "off"
+  );
+}
+
+function isApiModeEnabled(): boolean {
+  return !isFalseyEnv("PI_CLAUDE_CLI_API_MODE");
+}
+
 /**
  * Spawn a Claude CLI subprocess with all required flags for stream-json communication.
  *
  * @param modelId - The model ID to pass via --model flag
- * @param systemPrompt - Optional system prompt appended via --append-system-prompt
+ * @param systemPrompt - Optional system prompt passed to Claude CLI
  * @param options - Optional cwd, AbortSignal, and effort level
  * @returns The spawned ChildProcess with piped stdin/stdout/stderr
  */
@@ -47,6 +63,26 @@ export function spawnClaude(
     "stdio",
   ];
 
+  const apiMode = isApiModeEnabled();
+
+  const settingSources = process.env.PI_CLAUDE_CLI_SETTING_SOURCES;
+  if (settingSources !== undefined) {
+    args.push("--setting-sources", settingSources);
+  } else if (apiMode) {
+    args.push("--setting-sources", "");
+  }
+
+  const tools = process.env.PI_CLAUDE_CLI_TOOLS;
+  if (tools !== undefined) {
+    args.push("--tools", tools);
+  } else if (apiMode) {
+    args.push("--tools", "Read,Write,Edit,Bash,Grep,Glob");
+  }
+
+  if (apiMode || isTruthyEnv("PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS")) {
+    args.push("--disable-slash-commands");
+  }
+
   if (options?.resumeSessionId) {
     // Resume an existing session — CLI loads prior conversation from disk
     args.push("--resume", options.resumeSessionId);
@@ -57,13 +93,15 @@ export function spawnClaude(
 
   if (systemPrompt) {
     // Write system prompt to a temp file to avoid ENAMETOOLONG on Windows.
-    // Claude CLI's --append-system-prompt accepts a file path or literal text.
     const tmpFile = join(
       tmpdir(),
       `pi-claude-cli-sysprompt-${process.pid}.txt`,
     );
     writeFileSync(tmpFile, systemPrompt, "utf-8");
-    args.push("--append-system-prompt", tmpFile);
+    args.push(
+      apiMode ? "--system-prompt-file" : "--append-system-prompt",
+      tmpFile,
+    );
   }
 
   if (options?.effort) {
@@ -74,9 +112,15 @@ export function spawnClaude(
     args.push("--mcp-config", options.mcpConfigPath);
   }
 
+  const env = { ...process.env };
+  if (apiMode || isTruthyEnv("PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY")) {
+    env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+  }
+
   const proc = spawn("claude", args, {
     stdio: ["pipe", "pipe", "pipe"],
     cwd: options?.cwd ?? process.cwd(),
+    env,
   });
 
   return proc as ChildProcess;

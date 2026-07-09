@@ -41,9 +41,19 @@ import {
   cleanupSystemPromptFile,
 } from "../src/process-manager";
 
+function resetClaudeContextEnv() {
+  delete process.env.PI_CLAUDE_CLI_API_MODE;
+  delete process.env.PI_CLAUDE_CLI_SETTING_SOURCES;
+  delete process.env.PI_CLAUDE_CLI_TOOLS;
+  delete process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
+  delete process.env.PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY;
+  delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+}
+
 describe("spawnClaude", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetClaudeContextEnv();
   });
 
   it("spawns claude with all required CLI flags", () => {
@@ -91,12 +101,13 @@ describe("spawnClaude", () => {
     expect(options.cwd).toBe("/custom/path");
   });
 
-  it("writes system prompt to temp file and passes path via --append-system-prompt", () => {
+  it("writes system prompt to temp file and passes path via --system-prompt-file in API mode", () => {
     spawnClaude("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
-    const idx = args.indexOf("--append-system-prompt");
+    expect(args).toContain("--system-prompt-file");
+    expect(args).not.toContain("--append-system-prompt");
+    const idx = args.indexOf("--system-prompt-file");
     expect(args[idx + 1]).toContain("pi-claude-cli-sysprompt-");
   });
 
@@ -110,10 +121,11 @@ describe("spawnClaude", () => {
     expect(readFileSync(tmpFile, "utf-8")).toBe("You are a helpful assistant.");
   });
 
-  it("does not include --append-system-prompt when no system prompt", () => {
+  it("does not include system prompt flags when no system prompt", () => {
     spawnClaude("claude-sonnet-4-5-20250929");
     const args = (spawn as any).mock.calls[0][1] as string[];
     expect(args).not.toContain("--append-system-prompt");
+    expect(args).not.toContain("--system-prompt-file");
   });
 
   it("returns the spawned ChildProcess", () => {
@@ -126,6 +138,7 @@ describe("spawnClaude", () => {
 describe("effort flag", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetClaudeContextEnv();
   });
 
   it("includes --effort and high in args when effort is high", () => {
@@ -169,13 +182,13 @@ describe("effort flag", () => {
     expect(args).not.toContain("--effort");
   });
 
-  it("is backward compatible - existing calls without effort still work", () => {
+  it("keeps existing calls without effort working", () => {
     spawnClaude("claude-sonnet-4-5-20250929", "system prompt", {
       cwd: "/path",
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--system-prompt-file");
     expect(args).not.toContain("--effort");
   });
 });
@@ -360,6 +373,7 @@ describe("validateCliAuth", () => {
 describe("CLI flags", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetClaudeContextEnv();
   });
 
   it("spawnClaude does NOT include --permission-mode or dontAsk in args", () => {
@@ -380,9 +394,104 @@ describe("CLI flags", () => {
   });
 });
 
+describe("Claude CLI context control env vars", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetClaudeContextEnv();
+    delete process.env.PI_CLAUDE_CLI_API_MODE;
+    delete process.env.PI_CLAUDE_CLI_SETTING_SOURCES;
+    delete process.env.PI_CLAUDE_CLI_TOOLS;
+    delete process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
+    delete process.env.PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY;
+    delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+  });
+
+  afterEach(() => {
+    delete process.env.PI_CLAUDE_CLI_API_MODE;
+    delete process.env.PI_CLAUDE_CLI_SETTING_SOURCES;
+    delete process.env.PI_CLAUDE_CLI_TOOLS;
+    delete process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
+    delete process.env.PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY;
+    delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+  });
+
+  it("enables API mode context controls by default", () => {
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+    const options = (spawn as any).mock.calls[0][2];
+
+    expect(args).toContain("--setting-sources");
+    expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
+    expect(args).toContain("--tools");
+    expect(args[args.indexOf("--tools") + 1]).toBe(
+      "Read,Write,Edit,Bash,Grep,Glob",
+    );
+    expect(args).toContain("--disable-slash-commands");
+    expect(options.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe("1");
+  });
+
+  it("can disable API mode and restore legacy context behavior", () => {
+    process.env.PI_CLAUDE_CLI_API_MODE = "0";
+
+    spawnClaude("claude-sonnet-4-5-20250929", "system prompt");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+    const options = (spawn as any).mock.calls[0][2];
+
+    expect(args).not.toContain("--setting-sources");
+    expect(args).not.toContain("--tools");
+    expect(args).not.toContain("--disable-slash-commands");
+    expect(args).toContain("--append-system-prompt");
+    expect(args).not.toContain("--system-prompt-file");
+    expect(options.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBeUndefined();
+  });
+
+  it("passes PI_CLAUDE_CLI_SETTING_SOURCES through to --setting-sources", () => {
+    process.env.PI_CLAUDE_CLI_SETTING_SOURCES = "user";
+
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--setting-sources");
+    const idx = args.indexOf("--setting-sources");
+    expect(args[idx + 1]).toBe("user");
+  });
+
+  it("passes PI_CLAUDE_CLI_TOOLS through to --tools", () => {
+    process.env.PI_CLAUDE_CLI_TOOLS = "default";
+
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--tools");
+    const idx = args.indexOf("--tools");
+    expect(args[idx + 1]).toBe("default");
+  });
+
+  it("adds --disable-slash-commands for truthy PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS when API mode is off", () => {
+    process.env.PI_CLAUDE_CLI_API_MODE = "false";
+    process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS = "true";
+
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--disable-slash-commands");
+  });
+
+  it("sets CLAUDE_CODE_DISABLE_AUTO_MEMORY for truthy PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY when API mode is off", () => {
+    process.env.PI_CLAUDE_CLI_API_MODE = "no";
+    process.env.PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY = "1";
+
+    spawnClaude("claude-sonnet-4-5-20250929");
+    const options = (spawn as any).mock.calls[0][2];
+
+    expect(options.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe("1");
+  });
+});
+
 describe("mcp-config flag", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetClaudeContextEnv();
   });
 
   it("spawnClaude with mcpConfigPath includes --mcp-config followed by the path", () => {
@@ -412,14 +521,14 @@ describe("mcp-config flag", () => {
     expect(args).not.toContain("--strict-mcp-config");
   });
 
-  it("backward compatibility - existing calls with only effort/cwd still work", () => {
+  it("existing calls with only effort/cwd still work", () => {
     spawnClaude("claude-sonnet-4-5-20250929", "system prompt", {
       cwd: "/path",
       effort: "high",
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--system-prompt-file");
     expect(args).toContain("--effort");
     expect(args).not.toContain("--mcp-config");
     expect(args).toContain("--permission-prompt-tool");
@@ -555,6 +664,7 @@ describe("process registry", () => {
 describe("resume session flag", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetClaudeContextEnv();
   });
 
   it("includes --resume followed by session ID when resumeSessionId is provided", () => {
