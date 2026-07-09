@@ -72,6 +72,15 @@ vi.mock("@mariozechner/pi-ai", () => ({
 import spawn from "cross-spawn";
 import { streamViaCli } from "../src/provider";
 
+function resetClaudeContextEnv() {
+  delete process.env.PI_CLAUDE_CLI_API_MODE;
+  delete process.env.PI_CLAUDE_CLI_SETTING_SOURCES;
+  delete process.env.PI_CLAUDE_CLI_TOOLS;
+  delete process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
+  delete process.env.PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY;
+  delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+}
+
 describe("provider registration (default export)", () => {
   it("registers provider with ID pi-claude-cli", async () => {
     const registerProvider = vi.fn();
@@ -124,11 +133,13 @@ describe("provider registration (default export)", () => {
 describe("streamViaCli", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetClaudeContextEnv();
     vi.useFakeTimers();
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    resetClaudeContextEnv();
   });
 
   it("returns an AssistantMessageEventStream", () => {
@@ -1907,6 +1918,7 @@ describe("streamViaCli", () => {
       const args = (spawn as any).mock.calls[0][1] as string[];
       expect(args).toContain("--resume");
       expect(args).not.toContain("--append-system-prompt");
+      expect(args).not.toContain("--system-prompt-file");
 
       // Clean up
       const proc = (spawn as any).mock.results[0].value;
@@ -1943,7 +1955,7 @@ describe("streamViaCli", () => {
       const idx = args.indexOf("--session-id");
       expect(args[idx + 1]).toBe("sess-cross");
       // Fresh session must send the system prompt and full history.
-      expect(args).toContain("--append-system-prompt");
+      expect(args).toContain("--system-prompt-file");
 
       // Clean up
       const proc = (spawn as any).mock.results[0].value;
