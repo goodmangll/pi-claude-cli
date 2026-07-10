@@ -41,6 +41,7 @@ import { createEventBridge } from "./event-bridge.js";
 import { handleControlRequest } from "./control-handler.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
+import { appendUsageLog, type UsageLogMode } from "./usage-log.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
 
@@ -195,20 +196,29 @@ export function streamViaCli(
       let forkParentId: string | undefined;
       let resumeSessionId: string | undefined;
       let newSessionId: string | undefined;
+      let usageLogMode: UsageLogMode = "fresh_full";
+      let decisionReason = "first_turn_or_no_prior_cli_turn";
+      let checkpointTurnCount: number | undefined;
       if (best) {
         // Fork the matching checkpoint into a fresh id and send only the delta.
         // The parent stays frozen and re-forkable for future rewinds.
         forkParentId = best.cliSessionId;
         newSessionId = randomUUID();
+        usageLogMode = "fork_delta";
+        decisionReason = "deepest_checkpoint_match";
+        checkpointTurnCount = best.turnCount;
       } else if (checkpoints && checkpoints.length > 0) {
         // Have checkpoints but none match — the whole history diverged. Start a
         // fresh session (random id; pi's id already names an on-disk session).
         newSessionId = randomUUID();
+        decisionReason = "no_matching_checkpoint";
       } else if (options?.sessionId && hasPriorCliTurn) {
         // No checkpoints (e.g. pi restarted, extension reloaded) but history
         // shows a prior CLI turn: fall back to resuming pi's session id in
         // place. It becomes a checkpoint below and is forked from then on.
         resumeSessionId = options.sessionId;
+        usageLogMode = "legacy_resume_delta";
+        decisionReason = "legacy_resume_without_checkpoints";
       } else {
         // First turn: create the session under pi's id when we have one.
         newSessionId = options?.sessionId;
@@ -460,6 +470,25 @@ export function streamViaCli(
         }
 
         const output = bridge.getOutput();
+
+        appendUsageLog({
+          mode: usageLogMode,
+          decisionReason,
+          model: model.id,
+          piSessionId: options?.sessionId,
+          cliSessionId: cliSessionIdUsed,
+          forkParentId,
+          resumeSessionId,
+          messageCount: messages.length,
+          deltaStart,
+          checkpointTurnCount,
+          promptChars:
+            typeof prompt === "string"
+              ? prompt.length
+              : JSON.stringify(prompt).length,
+          systemPrompt,
+          usage: output.usage,
+        });
 
         // If stopReason is toolUse but there are no pi-known tool calls in content,
         // it means only user MCP tools were called (filtered by event bridge).

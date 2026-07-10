@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Mock cross-spawn with PassThrough streams for readline compatibility
 vi.mock("cross-spawn", () => ({
@@ -79,6 +82,9 @@ function resetClaudeContextEnv() {
   delete process.env.PI_CLAUDE_CLI_DISABLE_SLASH_COMMANDS;
   delete process.env.PI_CLAUDE_CLI_DISABLE_AUTO_MEMORY;
   delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+  delete process.env.PI_CLAUDE_CLI_USAGE_LOG;
+  delete process.env.PI_CLAUDE_CLI_USAGE_LOG_PATH;
+  delete process.env.PI_CLAUDE_CLI_USAGE_DEBUG;
 }
 
 describe("provider registration (default export)", () => {
@@ -2174,6 +2180,75 @@ describe("streamViaCli", () => {
       expect(isFork(appendArgs)).toBe(true);
       expect(forkParent(appendArgs)).toBe(mintedId);
       expect(writtenPrompt(2)).toBe("next");
+    });
+
+    it("writes an opt-in JSONL usage record without prompt content", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pi-claude-cli-usage-"));
+      const logPath = join(dir, "usage.jsonl");
+      process.env.PI_CLAUDE_CLI_USAGE_LOG = "1";
+      process.env.PI_CLAUDE_CLI_USAGE_LOG_PATH = logPath;
+
+      const secretPrompt = "do not leak this prompt text";
+      streamViaCli(
+        model(),
+        {
+          messages: [{ role: "user", content: secretPrompt }],
+          systemPrompt: "stable system prompt",
+        },
+        { sessionId: "sess-usage-log" } as any,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.write(
+        JSON.stringify({
+          type: "stream_event",
+          event: {
+            type: "message_start",
+            message: {
+              usage: {
+                input_tokens: 120,
+                output_tokens: 0,
+                cache_read_input_tokens: 80,
+                cache_creation_input_tokens: 20,
+              },
+            },
+          },
+        }) + "\n",
+      );
+      proc.stdout.write(
+        JSON.stringify({ type: "result", subtype: "success", result: "ok" }) +
+          "\n",
+      );
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+
+      const raw = readFileSync(logPath, "utf8");
+      const lines = raw.trim().split("\n");
+      expect(lines).toHaveLength(1);
+      expect(raw).not.toContain(secretPrompt);
+
+      const record = JSON.parse(lines[0]);
+      expect(record.mode).toBe("fresh_full");
+      expect(record.decisionReason).toBe("first_turn_or_no_prior_cli_turn");
+      expect(record.model).toBe("claude-sonnet-4-5-20250929");
+      expect(record.messageCount).toBe(1);
+      expect(record.deltaStart).toBe(0);
+      expect(record.usage).toMatchObject({
+        inputTokens: 120,
+        outputTokens: 0,
+        cacheReadInputTokens: 80,
+        cacheCreationInputTokens: 20,
+      });
+      expect(record.cache.readRatio).toBeCloseTo(80 / 220);
+      expect(record.cache.missLikely).toBe(false);
+      expect(record.prompt.fullPromptChars).toBeGreaterThan(0);
+      expect(record.prompt.systemPromptHash).toMatch(/^sha256:/);
+      expect(record.ids.piSessionIdHash).toMatch(/^sha256:/);
+      expect(record.ids.cliSessionIdHash).toMatch(/^sha256:/);
+      expect(record.ids.piSessionIdHash).not.toContain("sess-usage-log");
+
+      rmSync(dir, { recursive: true, force: true });
     });
   });
 
