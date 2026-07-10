@@ -47,6 +47,7 @@ export function spawnClaude(
     mcpConfigPath?: string;
     resumeSessionId?: string;
     newSessionId?: string;
+    forkParentId?: string;
   },
 ): ChildProcess {
   const args = [
@@ -83,11 +84,22 @@ export function spawnClaude(
     args.push("--disable-slash-commands");
   }
 
-  if (options?.resumeSessionId) {
-    // Resume an existing session — CLI loads prior conversation from disk
+  if (options?.forkParentId && options?.newSessionId) {
+    // Fork an existing checkpoint into a fresh session id: the CLI reconstructs
+    // the parent's context, applies this turn's delta, and writes to the new
+    // id, leaving the parent frozen and re-forkable.
+    args.push(
+      "--resume",
+      options.forkParentId,
+      "--fork-session",
+      "--session-id",
+      options.newSessionId,
+    );
+  } else if (options?.resumeSessionId) {
+    // Resume an existing session in place — CLI loads prior conversation from disk
     args.push("--resume", options.resumeSessionId);
   } else if (options?.newSessionId) {
-    // First turn: create session with this ID so subsequent turns can --resume it
+    // First turn: create session with this ID so subsequent turns can fork it
     args.push("--session-id", options.newSessionId);
   }
 
