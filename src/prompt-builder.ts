@@ -173,9 +173,12 @@ export function resumeDeltaStartIndex(messages: any[]): number {
  *
  * Falls back to full prompt if the message structure is unexpected.
  */
-export function buildResumePrompt(context: {
-  messages: any[];
-}): string | AnthropicContentBlock[] {
+export function buildResumePrompt(
+  context: {
+    messages: any[];
+  },
+  deltaStart?: number,
+): string | AnthropicContentBlock[] {
   const messages = context.messages;
   if (messages.length === 0) return "";
 
@@ -183,11 +186,19 @@ export function buildResumePrompt(context: {
   const finalUserIndex = findFinalUserMessageIndex(messages);
   if (finalUserIndex < 0) return "";
 
-  // Collect new messages: everything from the last assistant turn onwards
-  // (tool results from the last assistant + the new user message)
+  // Collect new messages: everything the resumed/forked CLI session does not
+  // already hold. The provider passes the chosen checkpoint's turnCount as the
+  // delta boundary; without one we fall back to the last-user-message heuristic.
+  //
+  // Assistant messages in this range are intentionally skipped: a forked
+  // checkpoint already contains the assistant turn it generated, so re-sending
+  // it would duplicate content (and re-bill it). Only toolResults and the user
+  // message carry genuinely new content. The provider guarantees every
+  // assistant message in this range belongs to this CLI lineage before it
+  // selects the checkpoint, so nothing real is dropped.
   const newMessages: any[] = [];
 
-  const startIdx = resumeDeltaStartIndex(messages);
+  const startIdx = deltaStart ?? resumeDeltaStartIndex(messages);
 
   for (let i = startIdx; i < messages.length; i++) {
     newMessages.push(messages[i]);
