@@ -157,41 +157,51 @@ export function streamViaCli(
           (m?.provider === "pi-claude-cli" || m?.api === "pi-claude-cli"),
       );
 
-      // Resume decision (see sessionCheckpoints). The delta boundary is where
-      // the new content since the last turn begins; everything before it the
-      // CLI session is expected to already hold.
-      const deltaStart = resumeDeltaStartIndex(messages);
+      // Resume decision (see sessionCheckpoints). The delta boundary follows the
+      // chosen checkpoint: everything from its turnCount onward is the delta,
+      // and everything before it the CLI session is expected to already hold.
       const checkpoints = options?.sessionId
         ? sessionCheckpoints.get(options.sessionId)
         : undefined;
 
       // Best checkpoint = the deepest one (largest turnCount) whose fingerprint
-      // still matches the incoming history prefix AND whose gap up to the delta
-      // boundary is only our own assistant turns (so the delta skips nothing
-      // real — e.g. turns produced by another provider after a /model switch).
+      // still matches the incoming history prefix AND whose tail (turnCount ..
+      // end) contains only our own assistant turns. The tail's assistant
+      // messages are dropped by buildResumePrompt (the forked session already
+      // holds them), so any foreign-provider assistant there — e.g. a turn
+      // produced by another provider after a /model switch — would be silently
+      // lost; such a checkpoint is rejected and we start fresh instead.
+      //
+      // Note we deliberately do NOT bound candidates by the last-user-message
+      // index: during an agentic tool loop no new user message arrives, so that
+      // index stays pinned at the original prompt and would reject every
+      // checkpoint, forcing a full-history replay on every tool step.
       let best: Checkpoint | undefined;
       if (checkpoints) {
         for (const cp of checkpoints) {
-          if (cp.turnCount > deltaStart) continue;
+          if (cp.turnCount >= messages.length) continue;
           if (fingerprintMessages(messages, cp.turnCount) !== cp.prefixHash) {
             continue;
           }
-          let gapOk = true;
-          for (let i = cp.turnCount; i < deltaStart; i++) {
+          let tailOk = true;
+          for (let i = cp.turnCount; i < messages.length; i++) {
             const m = messages[i];
             if (
-              !(
-                m?.role === "assistant" &&
-                (m?.provider === "pi-claude-cli" || m?.api === "pi-claude-cli")
-              )
+              m?.role === "assistant" &&
+              !(m?.provider === "pi-claude-cli" || m?.api === "pi-claude-cli")
             ) {
-              gapOk = false;
+              tailOk = false;
               break;
             }
           }
-          if (gapOk && (!best || cp.turnCount > best.turnCount)) best = cp;
+          if (tailOk && (!best || cp.turnCount > best.turnCount)) best = cp;
         }
       }
+      // Delta boundary for logging / prompt building: the chosen checkpoint's
+      // turnCount when forking, else the last-user-message heuristic.
+      const deltaStart = best
+        ? best.turnCount
+        : resumeDeltaStartIndex(messages);
 
       let forkParentId: string | undefined;
       let resumeSessionId: string | undefined;
@@ -245,7 +255,7 @@ export function streamViaCli(
           : undefined;
 
       const prompt = useDelta
-        ? buildResumePrompt(context)
+        ? buildResumePrompt(context, deltaStart)
         : buildPrompt(context);
       const systemPrompt = useDelta
         ? undefined

@@ -2182,6 +2182,66 @@ describe("streamViaCli", () => {
       expect(writtenPrompt(2)).toBe("next");
     });
 
+    it("forks the checkpoint during a tool loop (no new user message) instead of replaying full history", async () => {
+      // Regression: in an agentic tool loop the last user message stays pinned
+      // at the original prompt, so a last-user-anchored delta boundary rejected
+      // every checkpoint and replayed the full history on every tool step.
+      const u1 = { role: "user", content: "do the thing" };
+      const a1 = cliAssistant("calling a tool");
+      const tr1 = {
+        role: "toolResult",
+        toolName: "Read",
+        content: "file body",
+      };
+
+      await runTurn({ messages: [u1] }, "sess-toolloop"); // checkpoint @1
+
+      // pi executes the tool and re-invokes with the tool result appended —
+      // crucially, NO new user message.
+      const args = await runTurn({ messages: [u1, a1, tr1] }, "sess-toolloop");
+
+      // Must fork the @1 checkpoint and send only the delta (the tool result),
+      // not fall back to a fresh full-history replay.
+      expect(isFork(args)).toBe(true);
+      expect(forkParent(args)).toBe("sess-toolloop");
+      expect(sessionIdArg(args)).toMatch(UUID_RE);
+      const delta = writtenPrompt(1);
+      expect(delta).toContain("file body");
+      expect(delta).not.toContain("USER:"); // not a flattened full replay
+    });
+
+    it("keeps forking the deepest checkpoint across successive tool-loop steps", async () => {
+      const u1 = { role: "user", content: "start" };
+      const a1 = cliAssistant("tool call 1");
+      const tr1 = {
+        role: "toolResult",
+        toolName: "Read",
+        content: "result one",
+      };
+      const a2 = cliAssistant("tool call 2");
+      const tr2 = {
+        role: "toolResult",
+        toolName: "Grep",
+        content: "result two",
+      };
+
+      await runTurn({ messages: [u1] }, "sess-loop2"); // ckpt @1
+      const step1 = await runTurn({ messages: [u1, a1, tr1] }, "sess-loop2"); // ckpt @3
+      const step1Id = sessionIdArg(step1); // forked id embodying [u1,a1,tr1]
+
+      // Second tool step: still no user message. Must fork the DEEPEST
+      // checkpoint (@3, from step 1), sending only the newest tool result.
+      const step2 = await runTurn(
+        { messages: [u1, a1, tr1, a2, tr2] },
+        "sess-loop2",
+      );
+      expect(isFork(step2)).toBe(true);
+      expect(forkParent(step2)).toBe(step1Id);
+      const delta = writtenPrompt(2);
+      expect(delta).toContain("result two");
+      expect(delta).not.toContain("result one"); // step 1's result already in the fork
+    });
+
     it("writes an opt-in JSONL usage record without prompt content", async () => {
       const dir = mkdtempSync(join(tmpdir(), "pi-claude-cli-usage-"));
       const logPath = join(dir, "usage.jsonl");
