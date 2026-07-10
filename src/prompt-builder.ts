@@ -161,17 +161,115 @@ export function resumeDeltaStartIndex(messages: any[]): number {
 }
 
 /**
- * Build a prompt for a resumed session.
+ * Label for a tool-result message:
+ *   custom tool   -> "TOOL RESULT (deploy):"
+ *   built-in tool -> "TOOL RESULT (historical Read):"
+ */
+function toolResultLabel(message: any): string {
+  if (message.toolName && isCustomToolName(message.toolName)) {
+    return `TOOL RESULT (${message.toolName}):`;
+  }
+  const claudeToolName = message.toolName
+    ? mapPiToolNameToClaude(message.toolName)
+    : "unknown";
+  return `TOOL RESULT (historical ${claudeToolName}):`;
+}
+
+/**
+ * Core serializer shared by buildPrompt (full history) and buildResumePrompt
+ * (resume delta). Having a single implementation is what keeps the two paths
+ * from drifting — image passthrough used to live only in buildPrompt, so the
+ * resume path silently dropped tool-result images (e.g. `read` of a PNG).
  *
- * When resuming via --resume, the CLI already has the full conversation history.
- * We only need to send the new content since the last turn: the last assistant
- * response's tool results (if any) followed by the latest user message.
+ * The three image rules are applied uniformly here:
+ *   - final user message images -> passed through as Anthropic image blocks
+ *   - tool result images        -> passed through
+ *   - non-final user images     -> placeholder text (avoids replaying the
+ *                                  whole image history into every prompt)
  *
- * For tool_use flows: pi sends [user, assistant(toolCall), toolResult, ...]
- * We need to include tool results so the resumed session sees them, plus the
- * final user message.
+ * Returns a plain string when nothing needs passthrough, otherwise a
+ * ContentBlock[]. `labeled` controls the "USER:" / "ASSISTANT:" prefixes:
+ * true for the full prompt, false for the resume delta (the CLI session
+ * already holds the labeled history, so the delta is unlabeled new content).
  *
- * Falls back to full prompt if the message structure is unexpected.
+ * Resets and reports the module-level placeholder image counter.
+ */
+function serializeMessages(
+  messages: any[],
+  opts: { labeled: boolean },
+): string | AnthropicContentBlock[] {
+  placeholderImageCount = 0;
+  const { labeled } = opts;
+
+  const finalUserIndex = findFinalUserMessageIndex(messages);
+  const finalUserHasImages =
+    finalUserIndex >= 0 && contentHasImages(messages[finalUserIndex].content);
+  const anyToolResultHasImages = messages.some(
+    (m: any) => m.role === "toolResult" && toolResultHasImages(m.content),
+  );
+  const needsBlocks = finalUserHasImages || anyToolResultHasImages;
+
+  const historyParts: string[] = [];
+  const toolResultImageBlocks: AnthropicContentBlock[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    // In the blocks path the final user message is emitted separately (as its
+    // own content blocks) so it can carry images; skip it here. In the pure
+    // text path it is serialized inline like any other message.
+    if (needsBlocks && i === finalUserIndex) continue;
+    const message = messages[i];
+    if (message.role === "user") {
+      if (labeled) historyParts.push("USER:");
+      historyParts.push(userContentToText(message.content));
+    } else if (message.role === "assistant") {
+      if (labeled) historyParts.push("ASSISTANT:");
+      historyParts.push(contentToText(message.content));
+    } else if (message.role === "toolResult") {
+      historyParts.push(toolResultLabel(message));
+      historyParts.push(toolResultContentToText(message.content));
+      if (needsBlocks && Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (block.type === "image") {
+            const translated = translateImageBlock(block);
+            if (translated) {
+              toolResultImageBlocks.push(translated);
+              // Undo the placeholder counted by toolResultContentToText — the
+              // image is being passed through, not dropped.
+              placeholderImageCount--;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  let result: string | AnthropicContentBlock[];
+  if (needsBlocks) {
+    const blocks: AnthropicContentBlock[] = [];
+    const historyText = historyParts.join("\n");
+    if (historyText) blocks.push({ type: "text", text: historyText });
+    blocks.push(...toolResultImageBlocks);
+    if (finalUserIndex >= 0) {
+      blocks.push(...buildFinalUserContent(messages[finalUserIndex].content));
+    }
+    result = blocks;
+  } else {
+    result = historyParts.join("\n") || "";
+  }
+
+  if (placeholderImageCount > 0) {
+    console.warn(
+      `[pi-claude-cli] ${placeholderImageCount} image(s) in conversation history could not be included in the prompt`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Build a prompt for a resumed session. The CLI already holds the full
+ * labeled history, so this sends only the delta since the last turn: the run
+ * of tool results preceding the final user message, plus that user message.
+ * Delegates serialization (incl. image passthrough) to serializeMessages.
  */
 export function buildResumePrompt(context: {
   messages: any[];
@@ -183,46 +281,15 @@ export function buildResumePrompt(context: {
   const finalUserIndex = findFinalUserMessageIndex(messages);
   if (finalUserIndex < 0) return "";
 
-  // Collect new messages: everything from the last assistant turn onwards
-  // (tool results from the last assistant + the new user message)
-  const newMessages: any[] = [];
+  // Resume delta = the final user message plus the run of tool-result messages
+  // immediately preceding it (the CLI session already holds everything before
+  // that). resumeDeltaStartIndex is the shared boundary the provider's
+  // resume-consistency guard reasons about, so use it here too.
+  const delta = messages.slice(resumeDeltaStartIndex(messages));
 
-  const startIdx = resumeDeltaStartIndex(messages);
-
-  for (let i = startIdx; i < messages.length; i++) {
-    newMessages.push(messages[i]);
-  }
-
-  // If there are only tool results + one user message, build a combined prompt
-  const parts: string[] = [];
-  for (const msg of newMessages) {
-    if (msg.role === "toolResult") {
-      if (msg.toolName && isCustomToolName(msg.toolName)) {
-        parts.push(`TOOL RESULT (${msg.toolName}):`);
-      } else {
-        const claudeToolName = msg.toolName
-          ? mapPiToolNameToClaude(msg.toolName)
-          : "unknown";
-        parts.push(`TOOL RESULT (historical ${claudeToolName}):`);
-      }
-      parts.push(toolResultContentToText(msg.content));
-    } else if (msg.role === "user") {
-      // Check for images in the final user message
-      if (contentHasImages(msg.content)) {
-        const textSoFar = parts.join("\n");
-        const userContent = buildFinalUserContent(msg.content);
-        const result: AnthropicContentBlock[] = [];
-        if (textSoFar) {
-          result.push({ type: "text", text: textSoFar });
-        }
-        result.push(...userContent);
-        return result;
-      }
-      parts.push(userContentToText(msg.content));
-    }
-  }
-
-  return parts.join("\n") || "";
+  // Unlabeled: the CLI already has the labeled history; the delta is just the
+  // new content since the last turn.
+  return serializeMessages(delta, { labeled: false });
 }
 
 export function buildPrompt(context: {
@@ -244,111 +311,8 @@ export function buildPrompt(context: {
     return customToolPrompt;
   }
 
-  // Determine if any message has images worth passing through
-  const finalUserIndex = findFinalUserMessageIndex(context.messages);
-  const finalUserHasImages =
-    finalUserIndex >= 0 &&
-    contentHasImages(context.messages[finalUserIndex].content);
-  const anyToolResultHasImages = context.messages.some(
-    (m: any) => m.role === "toolResult" && toolResultHasImages(m.content),
-  );
-
-  if (finalUserHasImages || anyToolResultHasImages) {
-    // Build history as text (all messages except the final user message)
-    const historyParts: string[] = [];
-    const toolResultImageBlocks: AnthropicContentBlock[] = [];
-    for (let i = 0; i < context.messages.length; i++) {
-      if (i === finalUserIndex) continue; // Skip final user message -- handled separately
-      const message = context.messages[i];
-      if (message.role === "user") {
-        historyParts.push("USER:");
-        historyParts.push(userContentToText(message.content));
-      } else if (message.role === "assistant") {
-        historyParts.push("ASSISTANT:");
-        historyParts.push(contentToText(message.content));
-      } else if (message.role === "toolResult") {
-        if (message.toolName && isCustomToolName(message.toolName)) {
-          historyParts.push(`TOOL RESULT (${message.toolName}):`);
-        } else {
-          const claudeToolName = message.toolName
-            ? mapPiToolNameToClaude(message.toolName)
-            : "unknown";
-          historyParts.push(`TOOL RESULT (historical ${claudeToolName}):`);
-        }
-        // Extract text portion of tool result
-        historyParts.push(toolResultContentToText(message.content));
-        // Collect image blocks from tool results for passthrough
-        if (Array.isArray(message.content)) {
-          for (const block of message.content) {
-            if (block.type === "image") {
-              const translated = translateImageBlock(block);
-              if (translated) {
-                toolResultImageBlocks.push(translated);
-                // Undo the placeholder count from toolResultContentToText since we're passing through
-                placeholderImageCount--;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Build final user message content blocks
-    const finalUserContent =
-      finalUserIndex >= 0
-        ? buildFinalUserContent(context.messages[finalUserIndex].content)
-        : [];
-
-    // Combine: history text + tool result images + final user content blocks
-    const result: AnthropicContentBlock[] = [];
-    const historyText = historyParts.join("\n");
-    if (historyText) {
-      result.push({ type: "text", text: historyText });
-    }
-    // Insert tool result images after history text (Claude sees them in context)
-    result.push(...toolResultImageBlocks);
-    result.push(...finalUserContent);
-
-    if (placeholderImageCount > 0) {
-      console.warn(
-        `[pi-claude-cli] ${placeholderImageCount} image(s) in conversation history could not be included in the prompt`,
-      );
-    }
-
-    return result;
-  }
-
-  // No images in final user message: standard text-only path
-  const parts: string[] = [];
-
-  for (const message of context.messages) {
-    if (message.role === "user") {
-      parts.push("USER:");
-      parts.push(userContentToText(message.content));
-    } else if (message.role === "assistant") {
-      parts.push("ASSISTANT:");
-      parts.push(contentToText(message.content));
-    } else if (message.role === "toolResult") {
-      if (message.toolName && isCustomToolName(message.toolName)) {
-        // Custom tools: don't reference MCP tool name. Present result plainly.
-        parts.push(`TOOL RESULT (${message.toolName}):`);
-      } else {
-        const claudeToolName = message.toolName
-          ? mapPiToolNameToClaude(message.toolName)
-          : "unknown";
-        parts.push(`TOOL RESULT (historical ${claudeToolName}):`);
-      }
-      parts.push(toolResultContentToText(message.content));
-    }
-  }
-
-  if (placeholderImageCount > 0) {
-    console.warn(
-      `[pi-claude-cli] ${placeholderImageCount} image(s) in conversation history could not be included in the prompt`,
-    );
-  }
-
-  return parts.join("\n") || "";
+  // Full history, labeled with USER: / ASSISTANT: / TOOL RESULT: prefixes.
+  return serializeMessages(context.messages, { labeled: true });
 }
 
 /**

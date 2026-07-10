@@ -1064,4 +1064,45 @@ describe("buildResumePrompt", () => {
     expect((result as any[])[0].type).toBe("text");
     expect((result as any[])[1].type).toBe("image");
   });
+
+  it("passes through an image in a tool result within the resume delta", () => {
+    // Regression: a `read` on an image file produces a toolResult with an
+    // image block. In the resume/delta path this was silently downgraded to
+    // placeholder text, so Claude never saw the image. It must be translated
+    // and passed through as a ContentBlock[] just like the full-prompt path.
+    const context = {
+      messages: [
+        { role: "user", content: "read that screenshot" },
+        {
+          role: "assistant",
+          content: [
+            { type: "toolCall", name: "read", arguments: { path: "shot.png" } },
+          ],
+          provider: "pi-claude-cli",
+          api: "pi-claude-cli",
+        },
+        {
+          role: "toolResult",
+          toolName: "read",
+          content: [
+            { type: "text", text: "Read image file [image/png]" },
+            { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+          ],
+        },
+        { role: "user", content: "what is in it?" },
+      ],
+    };
+    const result = buildResumePrompt(context);
+    expect(Array.isArray(result)).toBe(true);
+    const arr = result as any[];
+    expect(arr).toContainEqual({
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
+    });
+    const text = arr
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    expect(text).toContain("what is in it?");
+  });
 });
