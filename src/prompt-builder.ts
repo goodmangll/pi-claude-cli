@@ -138,6 +138,29 @@ function buildCustomToolResultPrompt(messages: any[]): string | null {
 }
 
 /**
+ * Index where the "new content since the last turn" begins for a resumed
+ * session: the final user message, walked back over the run of toolResult
+ * messages immediately preceding it. Everything before this index is history
+ * the CLI session is assumed to already contain.
+ *
+ * Exported so the provider's resume-consistency guard can reason about the
+ * exact same delta boundary that buildResumePrompt sends.
+ */
+export function resumeDeltaStartIndex(messages: any[]): number {
+  const finalUserIndex = findFinalUserMessageIndex(messages);
+  if (finalUserIndex < 0) return messages.length;
+  let startIdx = finalUserIndex;
+  for (let i = finalUserIndex - 1; i >= 0; i--) {
+    if (messages[i].role === "toolResult") {
+      startIdx = i;
+    } else {
+      break;
+    }
+  }
+  return startIdx;
+}
+
+/**
  * Build a prompt for a resumed session.
  *
  * When resuming via --resume, the CLI already has the full conversation history.
@@ -164,16 +187,7 @@ export function buildResumePrompt(context: {
   // (tool results from the last assistant + the new user message)
   const newMessages: any[] = [];
 
-  // Walk backwards from finalUserIndex to find where new content starts.
-  // Include trailing toolResult messages that follow the last assistant turn.
-  let startIdx = finalUserIndex;
-  for (let i = finalUserIndex - 1; i >= 0; i--) {
-    if (messages[i].role === "toolResult") {
-      startIdx = i;
-    } else {
-      break;
-    }
-  }
+  const startIdx = resumeDeltaStartIndex(messages);
 
   for (let i = startIdx; i < messages.length; i++) {
     newMessages.push(messages[i]);

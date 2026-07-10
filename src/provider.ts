@@ -15,6 +15,7 @@
  */
 
 import { createInterface } from "node:readline";
+import { createHash, randomUUID } from "node:crypto";
 import {
   AssistantMessageEventStream,
   type Model,
@@ -24,6 +25,7 @@ import {
   buildPrompt,
   buildSystemPrompt,
   buildResumePrompt,
+  resumeDeltaStartIndex,
 } from "./prompt-builder.js";
 import {
   spawnClaude,
@@ -41,6 +43,53 @@ import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
+
+/**
+ * Fingerprint-guarded resume store.
+ *
+ * pi's ESC-ESC "rewind conversation history" truncates pi's own
+ * `context.messages`, but the Claude CLI's on-disk session (keyed by
+ * `--session-id`) keeps the full pre-rewind history. A blind `--resume` would
+ * therefore replay turns the user rewound away. To stay consistent we treat
+ * `--resume` as a cache that is valid ONLY when the incoming history is a
+ * strict append-extension of what we last sent under that session.
+ *
+ * Keyed by pi's stable session id. `cliSessionId` is the id we actually pass to
+ * the CLI (it diverges from pi's id after a rewind, when we mint a fresh one).
+ */
+const sessionFingerprints = new Map<
+  string,
+  { cliSessionId: string; turnCount: number; prefixHash: string }
+>();
+
+/**
+ * Test-only: reset the fingerprint store. Module-level state would otherwise
+ * leak between test cases that reuse session ids.
+ */
+export function clearSessionFingerprints(): void {
+  sessionFingerprints.clear();
+}
+
+/**
+ * Stable SHA-256 fingerprint of the first `count` messages. Used to detect
+ * whether a new request strictly extends the previously-sent history (safe to
+ * `--resume`) or diverges from it (rewind/edit — must start a fresh session).
+ */
+function fingerprintMessages(messages: any[], count: number): string {
+  const hash = createHash("sha256");
+  for (let i = 0; i < count; i++) {
+    const m = messages[i];
+    hash.update(
+      JSON.stringify({
+        role: m?.role,
+        content: m?.content,
+        toolName: m?.toolName,
+      }),
+    );
+    hash.update("\u0000");
+  }
+  return hash.digest("hex");
+}
 
 /** Extended stream options: pi's SimpleStreamOptions plus optional cwd and mcpConfigPath */
 type StreamViaCLiOptions = SimpleStreamOptions & {
@@ -89,13 +138,79 @@ export function streamViaCli(
       // --session-id. Using --resume against an unknown id fails silently
       // with "No conversation found with session ID" and produces an empty
       // assistant message.
-      const hasPriorCliTurn = (context.messages as any[]).some(
+      const messages = context.messages as any[];
+      const hasPriorCliTurn = messages.some(
         (m) =>
           m?.role === "assistant" &&
           (m?.provider === "pi-claude-cli" || m?.api === "pi-claude-cli"),
       );
-      const resumeSessionId =
-        options?.sessionId && hasPriorCliTurn ? options.sessionId : undefined;
+
+      // Fingerprint-guarded resume decision. Once we have sent history under
+      // this pi session, `--resume` is valid only when the incoming history
+      // strictly extends what we last sent (see sessionFingerprints). On
+      // divergence (ESC-ESC rewind, edit, branch switch) we mint a fresh CLI
+      // session id — the old id's on-disk session still holds the rewound
+      // turns — and replay the full history once.
+      const stored = options?.sessionId
+        ? sessionFingerprints.get(options.sessionId)
+        : undefined;
+      let resumeSessionId: string | undefined;
+      let newSessionId: string | undefined;
+      if (stored) {
+        let canResume =
+          messages.length >= stored.turnCount &&
+          fingerprintMessages(messages, stored.turnCount) === stored.prefixHash;
+        if (canResume) {
+          // Everything between the last-sent history and the delta boundary
+          // must be assistant turns produced by this provider (the CLI
+          // already knows its own answers). Anything else — e.g. turns from
+          // another provider after a mid-session /model switch — would be
+          // silently skipped by the delta prompt.
+          const deltaStart = resumeDeltaStartIndex(messages);
+          for (let i = stored.turnCount; i < deltaStart; i++) {
+            const m = messages[i];
+            if (
+              !(
+                m?.role === "assistant" &&
+                (m?.provider === "pi-claude-cli" || m?.api === "pi-claude-cli")
+              )
+            ) {
+              canResume = false;
+              break;
+            }
+          }
+        }
+        if (canResume) {
+          resumeSessionId = stored.cliSessionId;
+        } else {
+          // Divergence: the previous cliSessionId already has an on-disk
+          // session, so reusing it via --session-id would fail. Mint a new id.
+          newSessionId = randomUUID();
+        }
+      } else if (options?.sessionId && hasPriorCliTurn) {
+        // No fingerprint (e.g. pi was restarted and this extension reloaded)
+        // but the history shows a prior CLI turn under this session id:
+        // fall back to the legacy resume path.
+        resumeSessionId = options.sessionId;
+      } else {
+        newSessionId = options?.sessionId;
+      }
+
+      // Snapshot of what we're sending this turn; committed to the
+      // fingerprint store only after the CLI turn completes successfully
+      // (an errored turn may not have persisted a CLI session to resume).
+      const cliSessionIdUsed = resumeSessionId ?? newSessionId;
+      const pendingFingerprint =
+        options?.sessionId && cliSessionIdUsed
+          ? {
+              piSessionId: options.sessionId,
+              entry: {
+                cliSessionId: cliSessionIdUsed,
+                turnCount: messages.length,
+                prefixHash: fingerprintMessages(messages, messages.length),
+              },
+            }
+          : undefined;
 
       // Build prompt: if resuming, only send the latest user turn;
       // otherwise build the full flattened conversation history
@@ -120,7 +235,7 @@ export function streamViaCli(
         effort,
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
-        newSessionId: !resumeSessionId ? options?.sessionId : undefined,
+        newSessionId,
       });
       const getStderr = captureStderr(proc);
 
@@ -313,6 +428,16 @@ export function streamViaCli(
       // inside handleMessageStop prevents pi from executing tools.
       // Guard with streamEnded to avoid pushing done after an error was already pushed.
       if (!streamEnded) {
+        // Turn completed successfully: remember exactly what the CLI session
+        // now contains so the next turn can verify strict-append before
+        // resuming.
+        if (pendingFingerprint) {
+          sessionFingerprints.set(
+            pendingFingerprint.piSessionId,
+            pendingFingerprint.entry,
+          );
+        }
+
         const output = bridge.getOutput();
 
         // If stopReason is toolUse but there are no pi-known tool calls in content,
