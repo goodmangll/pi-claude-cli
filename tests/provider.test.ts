@@ -70,7 +70,7 @@ vi.mock("@mariozechner/pi-ai", () => ({
 }));
 
 import spawn from "cross-spawn";
-import { streamViaCli } from "../src/provider";
+import { streamViaCli, clearSessionFingerprints } from "../src/provider";
 
 function resetClaudeContextEnv() {
   delete process.env.PI_CLAUDE_CLI_API_MODE;
@@ -133,6 +133,7 @@ describe("provider registration (default export)", () => {
 describe("streamViaCli", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearSessionFingerprints();
     resetClaudeContextEnv();
     vi.useFakeTimers();
   });
@@ -1961,6 +1962,187 @@ describe("streamViaCli", () => {
       const proc = (spawn as any).mock.results[0].value;
       proc.stdout.end();
       await vi.advanceTimersByTimeAsync(100);
+    });
+  });
+
+  describe("resume consistency guard (fingerprint)", () => {
+    const model = () => mockModels[0] as any;
+    const cliAssistant = (content: string) => ({
+      role: "assistant",
+      content,
+      provider: "pi-claude-cli",
+      api: "pi-claude-cli",
+    });
+
+    /**
+     * Run a full turn to successful completion so the provider commits its
+     * session fingerprint. Returns the CLI args of this turn's spawn call.
+     */
+    async function runTurn(context: any, sessionId: string): Promise<string[]> {
+      const callIdx = (spawn as any).mock.calls.length;
+      streamViaCli(model(), context, { sessionId } as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[callIdx].value;
+      proc.stdout.write(
+        JSON.stringify({ type: "result", subtype: "success", result: "ok" }) +
+          "\n",
+      );
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+      return (spawn as any).mock.calls[callIdx][1] as string[];
+    }
+
+    function writtenPrompt(callIdx: number): string {
+      const proc = (spawn as any).mock.results[callIdx].value;
+      const written = proc.stdin.write.mock.calls[0][0] as string;
+      const parsed = JSON.parse(written.trim());
+      return typeof parsed.message.content === "string"
+        ? parsed.message.content
+        : JSON.stringify(parsed.message.content);
+    }
+
+    it("resumes when the new history strictly appends to the last-sent history", async () => {
+      const u1 = { role: "user", content: "first" };
+      await runTurn({ messages: [u1] }, "sess-fp-append");
+
+      const args = await runTurn(
+        {
+          messages: [
+            u1,
+            cliAssistant("reply 1"),
+            { role: "user", content: "second" },
+          ],
+        },
+        "sess-fp-append",
+      );
+
+      expect(args).toContain("--resume");
+      expect(args[args.indexOf("--resume") + 1]).toBe("sess-fp-append");
+      // Delta prompt: only the new user message, no flattened history labels
+      expect(writtenPrompt(1)).toBe("second");
+    });
+
+    it("starts a fresh CLI session with a new id after a rewind (history shortened)", async () => {
+      const u1 = { role: "user", content: "first" };
+      const a1 = cliAssistant("reply 1");
+      const u2 = { role: "user", content: "second" };
+      await runTurn({ messages: [u1] }, "sess-fp-rewind");
+      await runTurn({ messages: [u1, a1, u2] }, "sess-fp-rewind");
+
+      // ESC-ESC rewind: pi truncated its history back past turn 2 and the
+      // user typed a different message.
+      const args = await runTurn(
+        { messages: [u1, a1, { role: "user", content: "different second" }] },
+        "sess-fp-rewind",
+      );
+
+      expect(args).not.toContain("--resume");
+      expect(args).toContain("--session-id");
+      const newId = args[args.indexOf("--session-id") + 1];
+      expect(newId).not.toBe("sess-fp-rewind");
+      expect(newId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      // Full history replay, not a delta
+      expect(writtenPrompt(2)).toContain("USER:");
+      expect(writtenPrompt(2)).toContain("first");
+    });
+
+    it("starts a fresh CLI session when the last user message was edited", async () => {
+      const u1 = { role: "user", content: "first" };
+      await runTurn({ messages: [u1] }, "sess-fp-edit-last");
+
+      const args = await runTurn(
+        { messages: [{ role: "user", content: "first (edited)" }] },
+        "sess-fp-edit-last",
+      );
+
+      expect(args).not.toContain("--resume");
+      expect(args).toContain("--session-id");
+      expect(args[args.indexOf("--session-id") + 1]).not.toBe(
+        "sess-fp-edit-last",
+      );
+    });
+
+    it("starts a fresh CLI session when a middle message was edited", async () => {
+      const u1 = { role: "user", content: "first" };
+      const a1 = cliAssistant("reply 1");
+      const u2 = { role: "user", content: "second" };
+      await runTurn({ messages: [u1, a1, u2] }, "sess-fp-edit-mid");
+
+      const args = await runTurn(
+        {
+          messages: [
+            { role: "user", content: "first (edited)" },
+            a1,
+            u2,
+            cliAssistant("reply 2"),
+            { role: "user", content: "third" },
+          ],
+        },
+        "sess-fp-edit-mid",
+      );
+
+      expect(args).not.toContain("--resume");
+      expect(args).toContain("--session-id");
+      expect(args[args.indexOf("--session-id") + 1]).not.toBe(
+        "sess-fp-edit-mid",
+      );
+      expect(writtenPrompt(1)).toContain("USER:");
+    });
+
+    it("starts a fresh CLI session when foreign-provider turns sit between last-sent history and the delta", async () => {
+      const u1 = { role: "user", content: "first" };
+      await runTurn({ messages: [u1] }, "sess-fp-foreign");
+
+      // User switched provider mid-session, got an answer there, switched back.
+      const args = await runTurn(
+        {
+          messages: [
+            u1,
+            cliAssistant("reply 1"),
+            { role: "user", content: "asked elsewhere" },
+            {
+              role: "assistant",
+              content: "foreign reply",
+              provider: "anthropic",
+              api: "anthropic",
+            },
+            { role: "user", content: "back to claude cli" },
+          ],
+        },
+        "sess-fp-foreign",
+      );
+
+      expect(args).not.toContain("--resume");
+      expect(args).toContain("--session-id");
+    });
+
+    it("resumes the minted CLI session id after a rewind once history appends again", async () => {
+      const u1 = { role: "user", content: "first" };
+      await runTurn({ messages: [u1] }, "sess-fp-remint");
+
+      // Rewind: edited first message → fresh session under a minted id
+      const edited = { role: "user", content: "first (edited)" };
+      const rewindArgs = await runTurn(
+        { messages: [edited] },
+        "sess-fp-remint",
+      );
+      const mintedId = rewindArgs[rewindArgs.indexOf("--session-id") + 1];
+
+      // Next turn strictly appends → resume the MINTED id, not pi's id
+      const appendArgs = await runTurn(
+        {
+          messages: [
+            edited,
+            cliAssistant("reply"),
+            { role: "user", content: "next" },
+          ],
+        },
+        "sess-fp-remint",
+      );
+      expect(appendArgs).toContain("--resume");
+      expect(appendArgs[appendArgs.indexOf("--resume") + 1]).toBe(mintedId);
     });
   });
 
