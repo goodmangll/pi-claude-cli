@@ -70,7 +70,7 @@ vi.mock("@mariozechner/pi-ai", () => ({
 }));
 
 import spawn from "cross-spawn";
-import { streamViaCli, clearSessionFingerprints } from "../src/provider";
+import { streamViaCli, clearSessionCheckpoints } from "../src/provider";
 
 function resetClaudeContextEnv() {
   delete process.env.PI_CLAUDE_CLI_API_MODE;
@@ -133,7 +133,7 @@ describe("provider registration (default export)", () => {
 describe("streamViaCli", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    clearSessionFingerprints();
+    clearSessionCheckpoints();
     resetClaudeContextEnv();
     vi.useFakeTimers();
   });
@@ -1965,7 +1965,7 @@ describe("streamViaCli", () => {
     });
   });
 
-  describe("resume consistency guard (fingerprint)", () => {
+  describe("checkpoint-fork resume", () => {
     const model = () => mockModels[0] as any;
     const cliAssistant = (content: string) => ({
       role: "assistant",
@@ -1973,10 +1973,12 @@ describe("streamViaCli", () => {
       provider: "pi-claude-cli",
       api: "pi-claude-cli",
     });
+    const UUID_RE =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
     /**
      * Run a full turn to successful completion so the provider commits its
-     * session fingerprint. Returns the CLI args of this turn's spawn call.
+     * checkpoint. Returns the CLI args of this turn's spawn call.
      */
     async function runTurn(context: any, sessionId: string): Promise<string[]> {
       const callIdx = (spawn as any).mock.calls.length;
@@ -2001,9 +2003,14 @@ describe("streamViaCli", () => {
         : JSON.stringify(parsed.message.content);
     }
 
-    it("resumes when the new history strictly appends to the last-sent history", async () => {
+    const isFork = (args: string[]) => args.includes("--fork-session");
+    const forkParent = (args: string[]) => args[args.indexOf("--resume") + 1];
+    const sessionIdArg = (args: string[]) =>
+      args[args.indexOf("--session-id") + 1];
+
+    it("forks the newest checkpoint and sends a delta on strict append", async () => {
       const u1 = { role: "user", content: "first" };
-      await runTurn({ messages: [u1] }, "sess-fp-append");
+      await runTurn({ messages: [u1] }, "sess-append");
 
       const args = await runTurn(
         {
@@ -2013,62 +2020,85 @@ describe("streamViaCli", () => {
             { role: "user", content: "second" },
           ],
         },
-        "sess-fp-append",
+        "sess-append",
       );
 
-      expect(args).toContain("--resume");
-      expect(args[args.indexOf("--resume") + 1]).toBe("sess-fp-append");
-      // Delta prompt: only the new user message, no flattened history labels
+      // Fork the turn-1 checkpoint (sess-append) into a fresh id, delta only.
+      expect(isFork(args)).toBe(true);
+      expect(forkParent(args)).toBe("sess-append");
+      expect(sessionIdArg(args)).toMatch(UUID_RE);
       expect(writtenPrompt(1)).toBe("second");
     });
 
-    it("starts a fresh CLI session with a new id after a rewind (history shortened)", async () => {
+    it("forks the checkpoint at the rewind point and sends only the delta (no full replay)", async () => {
       const u1 = { role: "user", content: "first" };
       const a1 = cliAssistant("reply 1");
       const u2 = { role: "user", content: "second" };
-      await runTurn({ messages: [u1] }, "sess-fp-rewind");
-      await runTurn({ messages: [u1, a1, u2] }, "sess-fp-rewind");
+      await runTurn({ messages: [u1] }, "sess-rewind"); // checkpoint @1 = sess-rewind
+      await runTurn({ messages: [u1, a1, u2] }, "sess-rewind"); // checkpoint @3
 
-      // ESC-ESC rewind: pi truncated its history back past turn 2 and the
-      // user typed a different message.
+      // ESC-ESC rewind back past turn 2, user types a different message.
       const args = await runTurn(
         { messages: [u1, a1, { role: "user", content: "different second" }] },
-        "sess-fp-rewind",
+        "sess-rewind",
       );
 
-      expect(args).not.toContain("--resume");
-      expect(args).toContain("--session-id");
-      const newId = args[args.indexOf("--session-id") + 1];
-      expect(newId).not.toBe("sess-fp-rewind");
-      expect(newId).toMatch(
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-      );
-      // Full history replay, not a delta
-      expect(writtenPrompt(2)).toContain("USER:");
-      expect(writtenPrompt(2)).toContain("first");
+      // Deepest still-matching checkpoint is @1 (sess-rewind); fork it + delta.
+      expect(isFork(args)).toBe(true);
+      expect(forkParent(args)).toBe("sess-rewind");
+      expect(sessionIdArg(args)).toMatch(UUID_RE);
+      // Delta only — NOT a full flattened replay.
+      expect(writtenPrompt(2)).toBe("different second");
+      expect(writtenPrompt(2)).not.toContain("USER:");
     });
 
-    it("starts a fresh CLI session when the last user message was edited", async () => {
+    it("picks the deepest matching checkpoint on a shallow rewind", async () => {
       const u1 = { role: "user", content: "first" };
-      await runTurn({ messages: [u1] }, "sess-fp-edit-last");
+      const a1 = cliAssistant("reply 1");
+      const u2 = { role: "user", content: "second" };
+      const a2 = cliAssistant("reply 2");
+      const u3 = { role: "user", content: "third" };
+      await runTurn({ messages: [u1] }, "sess-deep"); // ckpt @1 = sess-deep
+      const t2 = await runTurn({ messages: [u1, a1, u2] }, "sess-deep"); // ckpt @3
+      const ckpt3Id = sessionIdArg(t2); // forked id embodying [u1,a1,u2]
+      await runTurn({ messages: [u1, a1, u2, a2, u3] }, "sess-deep"); // ckpt @5
+
+      // Rewind only the last turn: keep [u1,a1,u2,a2] prefix, re-ask.
+      const args = await runTurn(
+        {
+          messages: [u1, a1, u2, a2, { role: "user", content: "third prime" }],
+        },
+        "sess-deep",
+      );
+
+      // Deepest matching checkpoint is @3 (ckpt3Id), not @1.
+      expect(isFork(args)).toBe(true);
+      expect(forkParent(args)).toBe(ckpt3Id);
+      expect(writtenPrompt(3)).toBe("third prime");
+    });
+
+    it("starts a fresh full session when the first message was edited (no usable checkpoint)", async () => {
+      const u1 = { role: "user", content: "first" };
+      await runTurn({ messages: [u1] }, "sess-edit-first");
 
       const args = await runTurn(
         { messages: [{ role: "user", content: "first (edited)" }] },
-        "sess-fp-edit-last",
+        "sess-edit-first",
       );
 
+      // Nothing before the edited message to reuse → fresh session, full prompt.
+      expect(isFork(args)).toBe(false);
       expect(args).not.toContain("--resume");
-      expect(args).toContain("--session-id");
-      expect(args[args.indexOf("--session-id") + 1]).not.toBe(
-        "sess-fp-edit-last",
-      );
+      expect(sessionIdArg(args)).toMatch(UUID_RE);
+      expect(sessionIdArg(args)).not.toBe("sess-edit-first");
     });
 
-    it("starts a fresh CLI session when a middle message was edited", async () => {
+    it("starts a fresh full session when a middle message was edited", async () => {
       const u1 = { role: "user", content: "first" };
       const a1 = cliAssistant("reply 1");
       const u2 = { role: "user", content: "second" };
-      await runTurn({ messages: [u1, a1, u2] }, "sess-fp-edit-mid");
+      await runTurn({ messages: [u1] }, "sess-edit-mid");
+      await runTurn({ messages: [u1, a1, u2] }, "sess-edit-mid");
 
       const args = await runTurn(
         {
@@ -2080,20 +2110,19 @@ describe("streamViaCli", () => {
             { role: "user", content: "third" },
           ],
         },
-        "sess-fp-edit-mid",
+        "sess-edit-mid",
       );
 
+      // The edited first message invalidates every checkpoint prefix → fresh.
+      expect(isFork(args)).toBe(false);
       expect(args).not.toContain("--resume");
-      expect(args).toContain("--session-id");
-      expect(args[args.indexOf("--session-id") + 1]).not.toBe(
-        "sess-fp-edit-mid",
-      );
-      expect(writtenPrompt(1)).toContain("USER:");
+      expect(sessionIdArg(args)).toMatch(UUID_RE);
+      expect(writtenPrompt(2)).toContain("USER:");
     });
 
-    it("starts a fresh CLI session when foreign-provider turns sit between last-sent history and the delta", async () => {
+    it("starts a fresh full session when foreign-provider turns sit in the gap", async () => {
       const u1 = { role: "user", content: "first" };
-      await runTurn({ messages: [u1] }, "sess-fp-foreign");
+      await runTurn({ messages: [u1] }, "sess-foreign");
 
       // User switched provider mid-session, got an answer there, switched back.
       const args = await runTurn(
@@ -2111,26 +2140,27 @@ describe("streamViaCli", () => {
             { role: "user", content: "back to claude cli" },
           ],
         },
-        "sess-fp-foreign",
+        "sess-foreign",
       );
 
+      // A foreign turn in the gap means a delta would skip real content →
+      // fork is rejected, fall back to a fresh full session.
+      expect(isFork(args)).toBe(false);
       expect(args).not.toContain("--resume");
-      expect(args).toContain("--session-id");
+      expect(sessionIdArg(args)).toMatch(UUID_RE);
     });
 
-    it("resumes the minted CLI session id after a rewind once history appends again", async () => {
+    it("forks the newly minted checkpoint once history appends after a rewind", async () => {
       const u1 = { role: "user", content: "first" };
-      await runTurn({ messages: [u1] }, "sess-fp-remint");
+      await runTurn({ messages: [u1] }, "sess-remint");
 
-      // Rewind: edited first message → fresh session under a minted id
+      // Rewind: edited first message → fresh session under a minted id.
       const edited = { role: "user", content: "first (edited)" };
-      const rewindArgs = await runTurn(
-        { messages: [edited] },
-        "sess-fp-remint",
-      );
-      const mintedId = rewindArgs[rewindArgs.indexOf("--session-id") + 1];
+      const rewindArgs = await runTurn({ messages: [edited] }, "sess-remint");
+      const mintedId = sessionIdArg(rewindArgs);
+      expect(isFork(rewindArgs)).toBe(false);
 
-      // Next turn strictly appends → resume the MINTED id, not pi's id
+      // Next turn strictly appends → fork the MINTED checkpoint, not pi's id.
       const appendArgs = await runTurn(
         {
           messages: [
@@ -2139,10 +2169,11 @@ describe("streamViaCli", () => {
             { role: "user", content: "next" },
           ],
         },
-        "sess-fp-remint",
+        "sess-remint",
       );
-      expect(appendArgs).toContain("--resume");
-      expect(appendArgs[appendArgs.indexOf("--resume") + 1]).toBe(mintedId);
+      expect(isFork(appendArgs)).toBe(true);
+      expect(forkParent(appendArgs)).toBe(mintedId);
+      expect(writtenPrompt(2)).toBe("next");
     });
   });
 

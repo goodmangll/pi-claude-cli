@@ -45,29 +45,48 @@ import { isPiKnownClaudeTool } from "./tool-mapping.js";
 const INACTIVITY_TIMEOUT_MS = 180_000;
 
 /**
- * Fingerprint-guarded resume store.
- *
- * pi's ESC-ESC "rewind conversation history" truncates pi's own
- * `context.messages`, but the Claude CLI's on-disk session (keyed by
- * `--session-id`) keeps the full pre-rewind history. A blind `--resume` would
- * therefore replay turns the user rewound away. To stay consistent we treat
- * `--resume` as a cache that is valid ONLY when the incoming history is a
- * strict append-extension of what we last sent under that session.
- *
- * Keyed by pi's stable session id. `cliSessionId` is the id we actually pass to
- * the CLI (it diverges from pi's id after a rewind, when we mint a fresh one).
+ * A checkpoint records that a Claude CLI session (`cliSessionId`) embodies the
+ * first `turnCount` messages of a pi conversation (fingerprinted by
+ * `prefixHash`). Because the CLI reconstructs that context on `--resume`, we
+ * can fork a checkpoint into a fresh session and send only the new delta —
+ * paying for the delta's tokens, not a full-history replay.
  */
-const sessionFingerprints = new Map<
-  string,
-  { cliSessionId: string; turnCount: number; prefixHash: string }
->();
+type Checkpoint = {
+  turnCount: number;
+  prefixHash: string;
+  cliSessionId: string;
+};
 
 /**
- * Test-only: reset the fingerprint store. Module-level state would otherwise
+ * Checkpoint-fork resume store.
+ *
+ * pi's ESC-ESC "rewind conversation history" truncates pi's own
+ * `context.messages`, but a Claude CLI session keeps the full pre-rewind
+ * history. A blind `--resume` would replay turns the user rewound away.
+ *
+ * Instead of resuming a session in place, every turn *forks* the best-matching
+ * checkpoint (`claude --resume <cp> --fork-session --session-id <new>`), which
+ * leaves the parent frozen and re-forkable. We keep one checkpoint per turn
+ * (keyed by pi's stable session id):
+ *
+ *   - strict append -> fork the newest checkpoint, send the delta;
+ *   - rewind / edit  -> fork the deepest checkpoint that still matches the
+ *                       incoming history prefix, send the delta from there;
+ *   - no match at all -> a fresh session with the full history.
+ *
+ * This makes a rewind cost one delta (reusing the forked context + its prompt
+ * cache) instead of a full replay under a brand-new session. Verified against
+ * `claude` 2.0.60: fork reconstructs context, honors an explicit
+ * `--session-id`, and the parent survives repeated forks.
+ */
+const sessionCheckpoints = new Map<string, Checkpoint[]>();
+
+/**
+ * Test-only: reset the checkpoint store. Module-level state would otherwise
  * leak between test cases that reuse session ids.
  */
-export function clearSessionFingerprints(): void {
-  sessionFingerprints.clear();
+export function clearSessionCheckpoints(): void {
+  sessionCheckpoints.clear();
 }
 
 /**
@@ -130,14 +149,6 @@ export function streamViaCli(
     try {
       const cwd = options?.cwd ?? process.cwd();
 
-      // Resume only when this conversation already contains a prior assistant
-      // turn produced by pi-claude-cli (which means a CLI session has been
-      // established under this session id). Otherwise — e.g. when the user
-      // just switched to pi-claude-cli from another provider mid session, or
-      // when this is the first turn — start a fresh CLI session via
-      // --session-id. Using --resume against an unknown id fails silently
-      // with "No conversation found with session ID" and produces an empty
-      // assistant message.
       const messages = context.messages as any[];
       const hasPriorCliTurn = messages.some(
         (m) =>
@@ -145,29 +156,27 @@ export function streamViaCli(
           (m?.provider === "pi-claude-cli" || m?.api === "pi-claude-cli"),
       );
 
-      // Fingerprint-guarded resume decision. Once we have sent history under
-      // this pi session, `--resume` is valid only when the incoming history
-      // strictly extends what we last sent (see sessionFingerprints). On
-      // divergence (ESC-ESC rewind, edit, branch switch) we mint a fresh CLI
-      // session id — the old id's on-disk session still holds the rewound
-      // turns — and replay the full history once.
-      const stored = options?.sessionId
-        ? sessionFingerprints.get(options.sessionId)
+      // Resume decision (see sessionCheckpoints). The delta boundary is where
+      // the new content since the last turn begins; everything before it the
+      // CLI session is expected to already hold.
+      const deltaStart = resumeDeltaStartIndex(messages);
+      const checkpoints = options?.sessionId
+        ? sessionCheckpoints.get(options.sessionId)
         : undefined;
-      let resumeSessionId: string | undefined;
-      let newSessionId: string | undefined;
-      if (stored) {
-        let canResume =
-          messages.length >= stored.turnCount &&
-          fingerprintMessages(messages, stored.turnCount) === stored.prefixHash;
-        if (canResume) {
-          // Everything between the last-sent history and the delta boundary
-          // must be assistant turns produced by this provider (the CLI
-          // already knows its own answers). Anything else — e.g. turns from
-          // another provider after a mid-session /model switch — would be
-          // silently skipped by the delta prompt.
-          const deltaStart = resumeDeltaStartIndex(messages);
-          for (let i = stored.turnCount; i < deltaStart; i++) {
+
+      // Best checkpoint = the deepest one (largest turnCount) whose fingerprint
+      // still matches the incoming history prefix AND whose gap up to the delta
+      // boundary is only our own assistant turns (so the delta skips nothing
+      // real — e.g. turns produced by another provider after a /model switch).
+      let best: Checkpoint | undefined;
+      if (checkpoints) {
+        for (const cp of checkpoints) {
+          if (cp.turnCount > deltaStart) continue;
+          if (fingerprintMessages(messages, cp.turnCount) !== cp.prefixHash) {
+            continue;
+          }
+          let gapOk = true;
+          for (let i = cp.turnCount; i < deltaStart; i++) {
             const m = messages[i];
             if (
               !(
@@ -175,32 +184,45 @@ export function streamViaCli(
                 (m?.provider === "pi-claude-cli" || m?.api === "pi-claude-cli")
               )
             ) {
-              canResume = false;
+              gapOk = false;
               break;
             }
           }
+          if (gapOk && (!best || cp.turnCount > best.turnCount)) best = cp;
         }
-        if (canResume) {
-          resumeSessionId = stored.cliSessionId;
-        } else {
-          // Divergence: the previous cliSessionId already has an on-disk
-          // session, so reusing it via --session-id would fail. Mint a new id.
-          newSessionId = randomUUID();
-        }
+      }
+
+      let forkParentId: string | undefined;
+      let resumeSessionId: string | undefined;
+      let newSessionId: string | undefined;
+      if (best) {
+        // Fork the matching checkpoint into a fresh id and send only the delta.
+        // The parent stays frozen and re-forkable for future rewinds.
+        forkParentId = best.cliSessionId;
+        newSessionId = randomUUID();
+      } else if (checkpoints && checkpoints.length > 0) {
+        // Have checkpoints but none match — the whole history diverged. Start a
+        // fresh session (random id; pi's id already names an on-disk session).
+        newSessionId = randomUUID();
       } else if (options?.sessionId && hasPriorCliTurn) {
-        // No fingerprint (e.g. pi was restarted and this extension reloaded)
-        // but the history shows a prior CLI turn under this session id:
-        // fall back to the legacy resume path.
+        // No checkpoints (e.g. pi restarted, extension reloaded) but history
+        // shows a prior CLI turn: fall back to resuming pi's session id in
+        // place. It becomes a checkpoint below and is forked from then on.
         resumeSessionId = options.sessionId;
       } else {
+        // First turn: create the session under pi's id when we have one.
         newSessionId = options?.sessionId;
       }
 
-      // Snapshot of what we're sending this turn; committed to the
-      // fingerprint store only after the CLI turn completes successfully
-      // (an errored turn may not have persisted a CLI session to resume).
-      const cliSessionIdUsed = resumeSessionId ?? newSessionId;
-      const pendingFingerprint =
+      // Fork and legacy-resume both send only the delta (the CLI holds the
+      // rest); a fresh session gets the full flattened history + system prompt.
+      const useDelta = !!(forkParentId || resumeSessionId);
+
+      // Snapshot of what this turn establishes; committed to the checkpoint
+      // store only after the turn completes successfully (an errored turn may
+      // not have persisted a CLI session to fork).
+      const cliSessionIdUsed = newSessionId ?? resumeSessionId;
+      const pendingCheckpoint =
         options?.sessionId && cliSessionIdUsed
           ? {
               piSessionId: options.sessionId,
@@ -208,16 +230,14 @@ export function streamViaCli(
                 cliSessionId: cliSessionIdUsed,
                 turnCount: messages.length,
                 prefixHash: fingerprintMessages(messages, messages.length),
-              },
+              } as Checkpoint,
             }
           : undefined;
 
-      // Build prompt: if resuming, only send the latest user turn;
-      // otherwise build the full flattened conversation history
-      const prompt = resumeSessionId
+      const prompt = useDelta
         ? buildResumePrompt(context)
         : buildPrompt(context);
-      const systemPrompt = resumeSessionId
+      const systemPrompt = useDelta
         ? undefined
         : buildSystemPrompt(context, cwd);
 
@@ -236,6 +256,7 @@ export function streamViaCli(
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
         newSessionId,
+        forkParentId,
       });
       const getStderr = captureStderr(proc);
 
@@ -428,14 +449,14 @@ export function streamViaCli(
       // inside handleMessageStop prevents pi from executing tools.
       // Guard with streamEnded to avoid pushing done after an error was already pushed.
       if (!streamEnded) {
-        // Turn completed successfully: remember exactly what the CLI session
-        // now contains so the next turn can verify strict-append before
-        // resuming.
-        if (pendingFingerprint) {
-          sessionFingerprints.set(
-            pendingFingerprint.piSessionId,
-            pendingFingerprint.entry,
-          );
+        // Turn completed successfully: append a checkpoint so the next turn can
+        // fork the exact state this turn established (and earlier ones remain
+        // available for a deeper rewind).
+        if (pendingCheckpoint) {
+          const list =
+            sessionCheckpoints.get(pendingCheckpoint.piSessionId) ?? [];
+          list.push(pendingCheckpoint.entry);
+          sessionCheckpoints.set(pendingCheckpoint.piSessionId, list);
         }
 
         const output = bridge.getOutput();
