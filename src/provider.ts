@@ -47,6 +47,11 @@ import {
   saveCheckpoints,
   cliSessionExists,
 } from "./checkpoint-store.js";
+import {
+  snapshotPrefix,
+  reportMismatch,
+  clearCheckpointDiagnostics,
+} from "./checkpoint-diagnostics.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
 
@@ -102,6 +107,7 @@ const diskLoadAttempted = new Set<string>();
 export function clearSessionCheckpoints(): void {
   sessionCheckpoints.clear();
   diskLoadAttempted.clear();
+  clearCheckpointDiagnostics();
 }
 
 /**
@@ -265,6 +271,19 @@ export function streamViaCli(
         // fresh session (random id; pi's id already names an on-disk session).
         newSessionId = randomUUID();
         decisionReason = "no_matching_checkpoint";
+        // Diagnostics: if this was a strict append (not a real rewind), some
+        // prefix message serialized differently between save and re-check.
+        // Name the drifting message/field so the fingerprint can exclude it.
+        if (options?.sessionId) {
+          reportMismatch(
+            options.sessionId,
+            checkpoints
+              .map((c) => c.turnCount)
+              .filter((tc) => tc <= messages.length)
+              .sort((a, b) => b - a),
+            messages,
+          );
+        }
       } else if (options?.sessionId && hasPriorCliTurn) {
         // No checkpoints (e.g. pi restarted, extension reloaded) but history
         // shows a prior CLI turn: fall back to resuming pi's session id in
@@ -523,6 +542,13 @@ export function streamViaCli(
           // Mirror to disk so a reopened pi session (after quitting the TUI)
           // can fork this turn's CLI session instead of starting cold.
           saveCheckpoints(pendingCheckpoint.piSessionId, list);
+          // Snapshot the exact prefix this checkpoint was fingerprinted against
+          // (diagnostics only) so a later mismatch can name the drifting field.
+          snapshotPrefix(
+            pendingCheckpoint.piSessionId,
+            pendingCheckpoint.entry.turnCount,
+            messages,
+          );
         }
 
         const output = bridge.getOutput();
