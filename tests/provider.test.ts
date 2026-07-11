@@ -1,9 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { saveCheckpoints, cliSessionExists } from "../src/checkpoint-store";
 
 // Mock cross-spawn with PassThrough streams for readline compatibility
 vi.mock("cross-spawn", () => ({
@@ -2240,6 +2247,81 @@ describe("streamViaCli", () => {
       const delta = writtenPrompt(2);
       expect(delta).toContain("result two");
       expect(delta).not.toContain("result one"); // step 1's result already in the fork
+    });
+
+    describe("disk-persisted checkpoints (surviving a process restart)", () => {
+      let ckptDir: string;
+      let claudeDir: string;
+      const originalCkptDir = process.env.PI_CLAUDE_CLI_CHECKPOINT_DIR;
+      const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+
+      beforeEach(() => {
+        ckptDir = mkdtempSync(join(tmpdir(), "pi-claude-cli-ckpt-it-"));
+        claudeDir = mkdtempSync(join(tmpdir(), "pi-claude-cli-claudedir-it-"));
+        process.env.PI_CLAUDE_CLI_CHECKPOINT_DIR = ckptDir;
+        process.env.CLAUDE_CONFIG_DIR = claudeDir;
+      });
+      afterEach(() => {
+        rmSync(ckptDir, { recursive: true, force: true });
+        rmSync(claudeDir, { recursive: true, force: true });
+        process.env.PI_CLAUDE_CLI_CHECKPOINT_DIR = originalCkptDir;
+        process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      });
+
+      it("forks the persisted checkpoint after simulated process restart instead of replaying full history", async () => {
+        const u1 = { role: "user", content: "first" };
+        await runTurn({ messages: [u1] }, "sess-reopen"); // establishes CLI session "sess-reopen" on disk
+
+        // Prove the CLI session transcript is what makes the persisted
+        // checkpoint trustworthy on reopen.
+        const projectDir = join(claudeDir, "projects", "-fake-project");
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, "sess-reopen.jsonl"), "", "utf8");
+
+        // Simulate quitting the TUI and reopening: the in-memory checkpoint
+        // Map is gone, but the disk file (and the CLI transcript) survive.
+        clearSessionCheckpoints();
+
+        const args = await runTurn(
+          {
+            messages: [
+              u1,
+              cliAssistant("reply 1"),
+              { role: "user", content: "second" },
+            ],
+          },
+          "sess-reopen",
+        );
+
+        expect(isFork(args)).toBe(true);
+        expect(forkParent(args)).toBe("sess-reopen");
+        expect(writtenPrompt(1)).toBe("second");
+      });
+
+      it("falls back to a fresh session when the persisted CLI session no longer exists", async () => {
+        // A checkpoint on disk whose CLI session transcript is gone (Claude's
+        // own cleanup, /clear, a different machine) — never trusted, never
+        // forked. No matching transcript file is created in claudeDir.
+        saveCheckpoints("sess-stale", [
+          {
+            turnCount: 1,
+            prefixHash: "irrelevant-since-filtered-before-fingerprint-check",
+            cliSessionId: "sess-stale",
+          },
+        ]);
+        expect(cliSessionExists("sess-stale")).toBe(false);
+
+        const args = await runTurn(
+          { messages: [{ role: "user", content: "first" }] },
+          "sess-stale",
+        );
+
+        // Falls all the way back to the pre-persistence behavior: a fresh
+        // session, not a fork of the stale id, and no crash.
+        expect(isFork(args)).toBe(false);
+        expect(args).not.toContain("--resume");
+        expect(sessionIdArg(args)).toBe("sess-stale");
+      });
     });
 
     it("writes an opt-in JSONL usage record without prompt content", async () => {
