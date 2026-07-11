@@ -42,6 +42,11 @@ import { handleControlRequest } from "./control-handler.js";
 import { mapThinkingEffort } from "./thinking-config.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
 import { appendUsageLog, type UsageLogMode } from "./usage-log.js";
+import {
+  loadCheckpoints,
+  saveCheckpoints,
+  cliSessionExists,
+} from "./checkpoint-store.js";
 /** Inactivity timeout: kill subprocess if no stdout for 180 seconds (3 minutes). */
 const INACTIVITY_TIMEOUT_MS = 180_000;
 
@@ -83,11 +88,49 @@ type Checkpoint = {
 const sessionCheckpoints = new Map<string, Checkpoint[]>();
 
 /**
+ * pi session ids for which we've already attempted a disk load this process.
+ * Disk-loading involves a directory scan per candidate checkpoint (to verify
+ * the CLI session transcript still exists) — cache the attempt so a session
+ * with zero surviving checkpoints doesn't re-scan on every turn.
+ */
+const diskLoadAttempted = new Set<string>();
+
+/**
  * Test-only: reset the checkpoint store. Module-level state would otherwise
  * leak between test cases that reuse session ids.
  */
 export function clearSessionCheckpoints(): void {
   sessionCheckpoints.clear();
+  diskLoadAttempted.clear();
+}
+
+/**
+ * Checkpoints for a pi session, loading from disk on first sight in this
+ * process. A reopened pi session (`-r`/`-c` after quitting) starts with an
+ * empty in-memory `sessionCheckpoints` Map even though a prior run may have
+ * persisted checkpoints for it — this bridges that gap so the reopened
+ * session can fork instead of replaying full history on its first turn.
+ *
+ * Disk-loaded checkpoints are verified against the Claude Code CLI's own
+ * session transcripts before being trusted: the persisted CLI session may
+ * have been cleaned up since (Claude's own retention, `/clear`, a different
+ * machine). A checkpoint whose CLI session no longer exists is dropped here
+ * rather than being handed to the fork-selection logic, which has no way to
+ * distinguish a stale disk record from a live one and would otherwise fork a
+ * session that fails the turn.
+ */
+function getOrLoadCheckpoints(piSessionId: string): Checkpoint[] | undefined {
+  const inMemory = sessionCheckpoints.get(piSessionId);
+  if (inMemory) return inMemory;
+  if (diskLoadAttempted.has(piSessionId)) return undefined;
+  diskLoadAttempted.add(piSessionId);
+
+  const persisted = loadCheckpoints(piSessionId);
+  if (!persisted) return undefined;
+  const live = persisted.filter((cp) => cliSessionExists(cp.cliSessionId));
+  if (live.length === 0) return undefined;
+  sessionCheckpoints.set(piSessionId, live);
+  return live;
 }
 
 /**
@@ -161,7 +204,7 @@ export function streamViaCli(
       // chosen checkpoint: everything from its turnCount onward is the delta,
       // and everything before it the CLI session is expected to already hold.
       const checkpoints = options?.sessionId
-        ? sessionCheckpoints.get(options.sessionId)
+        ? getOrLoadCheckpoints(options.sessionId)
         : undefined;
 
       // Best checkpoint = the deepest one (largest turnCount) whose fingerprint
@@ -477,6 +520,9 @@ export function streamViaCli(
             sessionCheckpoints.get(pendingCheckpoint.piSessionId) ?? [];
           list.push(pendingCheckpoint.entry);
           sessionCheckpoints.set(pendingCheckpoint.piSessionId, list);
+          // Mirror to disk so a reopened pi session (after quitting the TUI)
+          // can fork this turn's CLI session instead of starting cold.
+          saveCheckpoints(pendingCheckpoint.piSessionId, list);
         }
 
         const output = bridge.getOutput();
